@@ -1,12 +1,14 @@
 #ifdef INCLUDEPRED
+/*** Stripped all ISL components ***/
 
 /*
-Code has been succesively derived from the tagged PPM predictor simulator from Pierre Michaud, the OGEHL predictor simulator from by AndrÃ© Seznec, the TAGE predictor simulator from  AndrÃ© Seznec and Pierre Michaud
+Code has been succesively derived from the tagged PPM predictor simulator from Pierre Michaud, the OGEHL predictor simulator from by André Seznec, the TAGE predictor simulator from  André Seznec and Pierre Michaud
 
 */
 
 #include <inttypes.h>
 #include <math.h>
+#define SHARINGTABLES		// let us share the physical among several logic predictor tables
 #define INITHISTLENGTH		// uses the "best" history length we found
 
 #define NHIST 15		// 15 tagged tables + 1 bimodal table
@@ -26,8 +28,10 @@ int m[NHIST + 1] = {0, 3, 8, 12, 17, 33, 35, 67, 97, 138, 195, 330, 517, 1193, 1
 #define PHISTWIDTH 16		// width of the path history
 
 
+#ifndef SHARINGTABLES
 #define TBITS 6
 #define MAXTBITS 15
+#endif
 
 #define CWIDTH 3		// predictor counter width on the tagged tables
 #define HISTBUFFERLENGTH 4096	// we use a 4K entries history buffer to store the branch history
@@ -155,6 +159,7 @@ public:
         m[i] = m[i - 1] + 2;
 #endif
 
+#ifndef SHARINGTABLES
     for (int i = 1; i <= NHIST; i++)
       TB[i] = TBITS + (i - 1);
     TB[1]++;
@@ -175,6 +180,7 @@ public:
     {
       gtable[i] = new gentry[1 << (logg[i])];
     }
+#endif
 
 
     //initialisation of the functions for index and tag computations

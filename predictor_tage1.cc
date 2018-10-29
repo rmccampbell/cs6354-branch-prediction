@@ -1,38 +1,84 @@
-#include "predictor.h"
-#include <cstdlib>
-#include <time.h>
-#include <bitset>
+// Author: Hongliang Gao;   Created: Jan 27 2011
+// Description: sample predictors for cbp3.
 
-#define BIMODAL_CTR_MAX  3
-#define BIMODAL_CTR_INIT 2
-#define TAGPRED_CTR_MAX  7
-#define TAGPRED_CTR_INIT 0
-#define BIMODALLOG   14
-#define NUMTAGTABLES 4
-#define TAGPREDLOG 12
+#include <stdio.h>
+#include <cassert>
+#include <string.h>
+#include <inttypes.h>
 
-/////////////// STORAGE BUDGET JUSTIFICATION ////////////////
-// Total storage budget: 32KB + 17 bits
-// Total PHT counters: 2^17
-// Total PHT size = 2^17 * 2 bits/counter = 2^18 bits = 32KB
-// GHR size: 17 bits
-// Total Size = PHT size + GHR size
-/////////////////////////////////////////////////////////////
+using namespace std;
+#include "cbp3_def.h"
+#include "cbp3_framework.h"
 
-/////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////
-
-PREDICTOR::PREDICTOR(void)
+struct TagEntry
 {
+    int8_t ctr;
+    uint32_t tag;
+    uint8_t usefulBits;
+};
 
+// Folded History implementation ... from ghr (geometric length) -> compressed(target)
+struct CompressedHist
+{
+    /// Objective is to convert geomLengt of GHR into tagPredLog which is of length equal to the index of the corresponding bank
+    // It can be also used for tag when the final length would be the Tag
+    uint32_t geomLength;
+    uint32_t targetLength;
+    uint32_t compHist;
+
+    void updateCompHist(bitset<131> ghr)
+    {
+        // easier way below... see PPM paper Figure 2
+        // creating important masks
+        int mask = (1 << targetLength) - 1;
+        int mask1 = ghr[geomLength] << (geomLength % targetLength);
+        int mask2 = (1 << targetLength);
+        compHist  = (compHist << 1) + ghr[0];
+        compHist ^= ((compHist & mask2) >> targetLength);
+        compHist ^= mask1;
+        compHist &= mask;
+
+    }
+};
+
+bitset<131> GHR;
+int PHR;
+// Bimodal
+uint32_t  *bimodal;          // pattern history table
+uint32_t  historyLength; // history length
+uint32_t  numBimodalEntries; // entries in pht
+uint32_t  bimodalLog;
+//Tagged Predictors
+TagEntry *tagPred[NUMTAGTABLES];
+uint32_t numTagPredEntries;
+uint32_t tagPredLog;
+uint32_t geometric[NUMTAGTABLES];
+//Compressed Buffers
+CompressedHist indexComp[NUMTAGTABLES];
+CompressedHist tagComp[2][NUMTAGTABLES];
+
+// Predictions need to be global ?? recheck
+bool primePred;
+bool altPred;
+int primeBank;
+int altBank;
+// index had to be made global else recalculate for update
+uint32_t indexTagPred[NUMTAGTABLES];
+uint32_t tag[NUMTAGTABLES];
+uint32_t clock;
+int clock_flip;
+int32_t altBetterCount;
+
+
+void PredictorInit() {
     /// First initiating Bimodal Table
     // Its a simple 2 bit counter table
 
     bimodalLog    = BIMODALLOG;
     numBimodalEntries   = (1<< bimodalLog);
-    bimodal = new UINT32[numBimodalEntries];
+    bimodal = new uint32_t[numBimodalEntries];
 
-    for(UINT32 ii=0; ii< numBimodalEntries; ii++)
+    for(uint32_t ii=0; ii< numBimodalEntries; ii++)
     {
         bimodal[ii]=BIMODAL_CTR_INIT;
     }
@@ -42,13 +88,11 @@ PREDICTOR::PREDICTOR(void)
     numTagPredEntries = (1 << tagPredLog);
     //cout << " No of entries in tag predictors = " << numTagPredEntries << endl;
 
-    for(UINT32 ii = 0; ii < NUMTAGTABLES ; ii++)
+    for(uint32_t ii = 0; ii < NUMTAGTABLES; ii++)
     {
         tagPred[ii] = new TagEntry[numTagPredEntries];
-    }
-    for(UINT32 ii = 0; ii < NUMTAGTABLES; ii++)
-    {
-        for(UINT32 j =0; j < numTagPredEntries; j++)
+
+        for(uint32_t j =0; j < numTagPredEntries; j++)
         {
             tagPred[ii][j].ctr = 0;
             tagPred[ii][j].tag = 0;
@@ -129,16 +173,47 @@ PREDICTOR::PREDICTOR(void)
     altBetterCount = 8;
 }
 
-/////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////
 
-bool   PREDICTOR::GetPrediction(UINT32 PC){
+void PredictorReset() {
+    // this function is called before EVERY run
+    // it is used to reset predictors and change configurations
+
+}
+
+
+void PredictorRunACycle() {
+    // get info about what uops are processed at each pipeline stage
+    const cbp3_cycle_activity_t *cycle_info = get_cycle_info();
+
+    // make prediction at fetch stage
+    for (int i = 0; i < cycle_info->num_fetch; i++) {
+        uint32_t fe_ptr = cycle_info->fetch_q[i];
+        const cbp3_uop_dynamic_t *uop = &fetch_entry(fe_ptr)->uop;
+        if (uop->type & IS_BR_CONDITIONAL) {
+            bool pred = GetPrediction(uop->pc);
+            assert(report_pred(fe_ptr, false, pred));
+
+			UpdatePredictor(uop->pc, uop->br_taken, uop->br_target);
+            // UpdateFetch(uop->pc, uop->br_taken, uop->br_target);
+        }
+    }
+
+    for (int i = 0; i < cycle_info->num_retire; i++) {
+        uint32_t rob_ptr = cycle_info->retire_q[i];
+        const cbp3_uop_dynamic_t *uop = &rob_entry(rob_ptr)->uop;
+        if (uop->type & IS_BR_CONDITIONAL) {
+            // UpdatePredictor(uop->pc, uop->br_taken, uop->br_target);
+        }
+    }
+}
+
+bool GetPrediction(uint32_t pc){
 
     /// Base Prediction
 
     bool basePrediction;
-    UINT32 bimodalIndex   = (PC) % (numBimodalEntries);
-    UINT32 bimodalCounter = bimodal[bimodalIndex];
+    uint32_t bimodalIndex   = (pc) % (numBimodalEntries);
+    uint32_t bimodalCounter = bimodal[bimodalIndex];
 
     if(bimodalCounter > BIMODAL_CTR_MAX/2){
         basePrediction =  1;
@@ -152,7 +227,7 @@ bool   PREDICTOR::GetPrediction(UINT32 PC){
     // pc[9:0] xor CSR1 xor (CSR2 << 1)
     for(int i = 0; i < NUMTAGTABLES; i++)
     {
-        tag[i] = PC ^ tagComp[0][i].compHist ^ (tagComp[1][i].compHist << 1);
+        tag[i] = pc ^ tagComp[0][i].compHist ^ (tagComp[1][i].compHist << 1);
         /// These need to be masked
         // 9 bit tags for T0 and T1 // 8 bit tags for T2 and T3
     }
@@ -164,20 +239,20 @@ bool   PREDICTOR::GetPrediction(UINT32 PC){
 
     // How to get index for each bank ??
     // bank 1
-    // Hash of PC, PC >> index length important , GHR geometric, path info
-    UINT32 index_mask = ((1<<TAGPREDLOG) - 1);
+    // Hash of pc, pc >> index length important , GHR geometric, path info
+    uint32_t index_mask = ((1<<TAGPREDLOG) - 1);
 
 
-    /*indexTagPred[0] = PC ^ (PC >> TAGPREDLOG) ^ indexComp[0].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
-      indexTagPred[1] = PC ^ (PC >> TAGPREDLOG) ^ indexComp[1].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
-      indexTagPred[2] = PC ^ (PC >> TAGPREDLOG) ^ indexComp[2].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
-      indexTagPred[3] = PC ^ (PC >> TAGPREDLOG) ^ indexComp[3].compHist ^ PHR ^ (PHR >> TAGPREDLOG);*/
-    indexTagPred[0] = PC ^ (PC >> TAGPREDLOG) ^ indexComp[0].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
-    indexTagPred[1] = PC ^ (PC >> (TAGPREDLOG - 1)) ^ indexComp[1].compHist ^ (PHR );
-    indexTagPred[2] = PC ^ (PC >> (TAGPREDLOG - 2)) ^ indexComp[2].compHist ^ (PHR & 31);
-    indexTagPred[3] = PC ^ (PC >> (TAGPREDLOG - 3)) ^ indexComp[3].compHist ^ (PHR & 7);  // 1 & 63 gives 3.358 // shuttle 31 and 15: 3.250 //ece 31 and 1: 3.252
+    /*indexTagPred[0] = pc ^ (pc >> TAGPREDLOG) ^ indexComp[0].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
+      indexTagPred[1] = pc ^ (pc >> TAGPREDLOG) ^ indexComp[1].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
+      indexTagPred[2] = pc ^ (pc >> TAGPREDLOG) ^ indexComp[2].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
+      indexTagPred[3] = pc ^ (pc >> TAGPREDLOG) ^ indexComp[3].compHist ^ PHR ^ (PHR >> TAGPREDLOG);*/
+    indexTagPred[0] = pc ^ (pc >> TAGPREDLOG) ^ indexComp[0].compHist ^ PHR ^ (PHR >> TAGPREDLOG);
+    indexTagPred[1] = pc ^ (pc >> (TAGPREDLOG - 1)) ^ indexComp[1].compHist ^ (PHR );
+    indexTagPred[2] = pc ^ (pc >> (TAGPREDLOG - 2)) ^ indexComp[2].compHist ^ (PHR & 31);
+    indexTagPred[3] = pc ^ (pc >> (TAGPREDLOG - 3)) ^ indexComp[3].compHist ^ (PHR & 7);  // 1 & 63 gives 3.358 // shuttle 31 and 15: 3.250 //ece 31 and 1: 3.252
     /// These need to be masked   // shuttle : 1023 63 and 15: 3.254 // ece 1023, 31 and 1 : 3.254
-    ////  63 and 7  and PC  -2 -4 -6 // 63 and 1 gives 3.256  // 63 and 7 s: // 31 and 7 : 3.243 best !
+    ////  63 and 7  and pc  -2 -4 -6 // 63 and 1 gives 3.256  // 63 and 7 s: // 31 and 7 : 3.243 best !
     for(int i = 0; i < NUMTAGTABLES; i++)
     {
         indexTagPred[i] = indexTagPred[i] & index_mask;
@@ -223,17 +298,17 @@ bool   PREDICTOR::GetPrediction(UINT32 PC){
         else
         {
             if(tagPred[altBank][indexTagPred[altBank]].ctr >= TAGPRED_CTR_MAX/2)
-                altPred = TAKEN;
+                altPred = true;
             else
-                altPred = NOT_TAKEN;
+                altPred = false;
         }
 
         if((tagPred[primeBank][indexTagPred[primeBank]].ctr  != 3) ||(tagPred[primeBank][indexTagPred[primeBank]].ctr != 4 ) || (tagPred[primeBank][indexTagPred[primeBank]].usefulBits != 0) || (altBetterCount < 8))
         {
             if(tagPred[primeBank][indexTagPred[primeBank]].ctr >= TAGPRED_CTR_MAX/2)
-                primePred = TAKEN;
+                primePred = true;
             else
-                primePred = NOT_TAKEN;
+                primePred = false;
             return primePred;
         }
         else
@@ -248,10 +323,12 @@ bool   PREDICTOR::GetPrediction(UINT32 PC){
     }
 }
 
-/////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////
+void UpdateFetch(uint32_t pc, bool resolveDir, uint32_t branchTarget) {
+    
+}
 
-void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT32 branchTarget){
+void UpdatePredictor(uint32_t pc, bool resolveDir, uint32_t branchTarget){
+    bool predDir = GetPrediction(pc);
 
     bool strong_old_present = false;
     bool new_entry = 0;
@@ -286,7 +363,7 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
     }
     else
     {
-        UINT32 bimodalIndex   = (PC) % (numBimodalEntries);
+        uint32_t bimodalIndex   = (pc) % (numBimodalEntries);
         if(resolveDir)
         {
             bimodal[bimodalIndex] = SatIncrement(bimodal[bimodalIndex], BIMODAL_CTR_MAX);
@@ -297,10 +374,10 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
         }
     }
     // Check if the current Entry which gave the prediction is a newly allocated entry or not.
-	if (primeBank < NUMTAGTABLES)
-	{
+    if (primeBank < NUMTAGTABLES)
+    {
 
-	    if((tagPred[primeBank][indexTagPred[primeBank]].usefulBits == 0) &&((tagPred[primeBank][indexTagPred[primeBank]].ctr  == 3) || (tagPred[primeBank][indexTagPred[primeBank]].ctr  == 4)))
+        if((tagPred[primeBank][indexTagPred[primeBank]].usefulBits == 0) &&((tagPred[primeBank][indexTagPred[primeBank]].ctr  == 3) || (tagPred[primeBank][indexTagPred[primeBank]].ctr  == 4)))
         {
             new_entry = true;
 
@@ -320,8 +397,8 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
                     altBetterCount--;
                 }
             }
-	    }
-	}
+        }
+    }
 
 
     // Proceeding to allocation of the entry.
@@ -402,9 +479,9 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
 
 
     // Periodic Useful bit Reset Logic ( Important so as to optimize compared to PPM paper)
-	clock++;
+    clock++;
     //for every 256 K instruction 1st MSB than LSB
-	if(clock == (256*1024))
+    if(clock == (256*1024))
     {
         // reset clock
         clock = 0;
@@ -417,11 +494,11 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
         {
             clock_flip = 1;
         }
-	    if(clock_flip == 1)
+        if(clock_flip == 1)
         {// MSB turn
             for (int jj = 0; jj < NUMTAGTABLES; jj++)
             {
-                for (UINT32 ii = 0; ii < numTagPredEntries; ii++)
+                for (uint32_t ii = 0; ii < numTagPredEntries; ii++)
                 {
                     tagPred[jj][ii].usefulBits = tagPred[jj][ii].usefulBits & 1;
                 }
@@ -431,21 +508,21 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
         {// LSB turn
             for (int jj = 0; jj < NUMTAGTABLES; jj++)
             {
-                for (UINT32 ii = 0; ii < numTagPredEntries; ii++)
+                for (uint32_t ii = 0; ii < numTagPredEntries; ii++)
                 {
                     tagPred[jj][ii].usefulBits = tagPred[jj][ii].usefulBits & 2;
                 }
             }
 
-	    }
+        }
 
-	}
+    }
 
 
     // update the GHR
     GHR = (GHR << 1);
 
-    if(resolveDir == TAKEN){
+    if (resolveDir == true){
         GHR.set(0,1);
     }
 
@@ -460,26 +537,16 @@ void  PREDICTOR::UpdatePredictor(UINT32 PC, bool resolveDir, bool predDir, UINT3
     // PHR update is simple, jus take the last bit ??
     // Always Limited to 16 bits as per paper.
     PHR = (PHR << 1);
-    if(PC & 1)
+    if(pc & 1)
     {
         PHR = PHR + 1;
     }
     PHR = (PHR & ((1 << 16) - 1));
 }
 
-/////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////
 
-void    PREDICTOR::TrackOtherInst(UINT32 PC, OpType opType, UINT32 branchTarget){
-
-    // This function is called for instructions which are not
-    // conditional branches, just in case someone decides to design
-    // a predictor that uses information from such instructions.
-    // We expect most contestants to leave this function untouched.
-
-    return;
+void PredictorRunEnd() {
 }
 
-
-/////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////
+void PredictorExit() {
+}
