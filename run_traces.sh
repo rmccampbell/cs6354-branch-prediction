@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e -o pipefail
-
 if [[ "$#" -eq 0 || "$1" =~ ^(-h|--help)$ ]]; then
 	echo "usage: run_traces.sh <out_dir> [-u num-uops-to-simulate]" >&2
 	exit 1
