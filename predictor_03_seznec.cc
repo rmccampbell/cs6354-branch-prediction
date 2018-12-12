@@ -18,7 +18,6 @@ my_predictor *mypred;
 void
 PredictorInit ()
 {
-
   mypred = new my_predictor ();
   assert (mypred);
 }
@@ -28,7 +27,6 @@ PredictorReset ()
 {
   // this function is called before EVERY run
   // it is used to reset predictors and change configurations
-
 }
 
 void
@@ -44,28 +42,26 @@ PredictorRunACycle ()
     const cbp3_uop_dynamic_t *uop = &fetch_entry (fe_ptr)->uop;
 
     if (uop->type & IS_BR_CONDITIONAL)
-
-	{
-	  // get prediction
+    {
+      // get prediction
 
       //We use only 18 bits of the PC
 
-	  bool gpred = mypred->predict_brcond (uop->pc & 0x3ffff, uop->type );
+      bool gpred = mypred->predict_brcond (uop->pc & 0x3ffff, uop->type );
 
-	  // report prediction:
-	  // you need to provide direction predictions for conditional branches,
-	  // targets of conditional branches are available at fetch stage.
-	  // for indirect branches, you need to provide target predictions.
-	  // you can report multiple predictions for the same branch
-	  // the framework will use the last reported prediction to calculate
-	  // misprediction penalty
-	  assert (report_pred (fe_ptr, false, gpred));
-	}
+      // report prediction:
+      // you need to provide direction predictions for conditional branches,
+      // targets of conditional branches are available at fetch stage.
+      // for indirect branches, you need to provide target predictions.
+      // you can report multiple predictions for the same branch
+      // the framework will use the last reported prediction to calculate
+      // misprediction penalty
+      assert (report_pred (fe_ptr, false, gpred));
+    }
     // update fetch branch history
     if (uop->type & 31)
     {
       // We use only 7 bits of the target PC
-
       mypred->FetchHistoryUpdate (uop->pc & 0x3ffff, uop->type, uop->br_taken, uop->br_target & 0x7f);
     }
 
@@ -75,7 +71,7 @@ PredictorRunACycle ()
 // for the contest just ignore this
 
     if (uop->type & 31)
-	{
+    {
       mypred->update_brcond (uop->pc & 0x3ffff, uop->type , uop->br_taken, uop->br_target & 0x7f);
     }
 
@@ -89,7 +85,7 @@ PredictorRunACycle ()
     const cbp3_uop_dynamic_t *uop = &rob_entry (rob_ptr)->uop;
 #ifndef  IMMEDIATEUPDATE
     if (uop->type & 31)
-	{
+    {
       mypred->update_brcond (uop->pc & 0x3ffff, uop->type , uop->br_taken, uop->br_target & 0x7f);
     }
 #endif
