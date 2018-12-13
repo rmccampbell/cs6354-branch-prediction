@@ -5,6 +5,8 @@ if [[ "$#" -eq 0 || "$1" =~ ^(-h|--help)$ ]]; then
     exit 1
 fi
 
+make
+
 dir="$(dirname "${BASH_SOURCE[0]}")"
 outdir="$1"
 
